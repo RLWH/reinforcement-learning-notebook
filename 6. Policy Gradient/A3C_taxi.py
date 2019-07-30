@@ -163,7 +163,7 @@ class Worker:
         self.thread_value_network.load_state_dict(global_value_network.state_dict)
 
         # Reset the thread-specific gradients
-        self.optimiser = torch.optim.Adam(list(thread_policy_network.parameters())
+        self.optimiser = torch.optim.Adam(list(self.global_policy_network.parameters())
                                       + list(thread_value_network.parameters()), lr=learning_rate)
 
 
@@ -270,7 +270,6 @@ class Worker:
 
         total_loss.backward()
 
-        copy_grad(self.)
 
             
 
