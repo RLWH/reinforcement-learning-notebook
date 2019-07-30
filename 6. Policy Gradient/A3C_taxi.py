@@ -162,10 +162,9 @@ class Worker:
         self.thread_policy_network.load_state_dict(global_policy_network.state_dict)
         self.thread_value_network.load_state_dict(global_value_network.state_dict)
 
-        # Reset the thread-specific gradients
-        self.optimiser = torch.optim.Adam(list(self.global_policy_network.parameters())
-                                      + list(thread_value_network.parameters()), lr=learning_rate)
-
+        # Setup the optimiser that optimise the global network parameters
+        self.global_optimiser = torch.optim.Adam(list(self.global_policy_network.parameters())
+                                      + list(self.global_value_network.parameters()), lr=learning_rate)
 
         # Some metrics to track
         self.total_reward = 0
@@ -264,15 +263,21 @@ class Worker:
         sum_actor_losses = torch.stack(actor_losses).sum()
         sum_entropy = torch.stack(entropys).sum()
 
-        # Run optimiser and obtain gradient
-        self.optimiser.zero_grad()
+        # Calculate the loss
         total_loss = sum_value_losses + sum_actor_losses + ENTROPY_BETA * sum_entropy
 
+        # Obtain gradient
         total_loss.backward()
 
+        # Run optimiser
+        self.global_optimiser.zero_grad()
 
-            
+        # Copy Gradient
+        copy_grad(self.thread_policy_network, self.global_policy_network)
+        copy_grad(self.thread_value_network, self.global_value_network)
 
+        # Run one step backprop
+        self.global_optimiser.step() 
 
 def train(global_policy_network, global_value_network, global_counter, lock):
     """
@@ -296,6 +301,9 @@ def train(global_policy_network, global_value_network, global_counter, lock):
 
     # Run the worker to collect the experiences
     batches, mean_rewards = worker.run()
+
+    # Learn the parameters
+    worker.learn() 
 
 
 if __name__ == "__main__":
