@@ -43,6 +43,7 @@ from tensorboardX import SummaryWriter
 
 GLOBAL_STEP = 1000
 NUM_PROCESSES = 4
+ENTROPY_BETA = 1e-3
 
 Experience = namedtuple("Experience",
                         ["state", "log_probs", "entropy", "actions", "rewards",
@@ -91,6 +92,7 @@ class ValueNetwork(nn.Module):
         x = self.fc2(x)
         return x
 
+# Some helper functions
 def calculate_rewards(rewards, gamma=0.99):
     """Calculate the discounted rewards"""
     G = 0
@@ -116,29 +118,60 @@ def make_env():
 
     return env, observation_space, action_space
 
+def copy_grad(from_net, to_net):
+    """
+    Copy the gradient from original network to target network
+    https://github.com/muupan/async-rl/blob/master/copy_param.py
+    Args:
+        from_net (torch.nn.Module)
+        to_net (torch.nn.Module)
+    """
+    # Extract the parameter names from the target net
+    to_net_params = dict(to_net.named_parameters())
+
+    # For each of the parameters from the from_net, extract the gradient
+    # Note that the gradient exists only when the backward() operation is called
+    for param_name, param in from_net.named_parameters():
+        to_net_params[param_name].grad[:] = param.grad
+    
 
 class Worker:
     """
     Worker for A3C Agent
+    A worker contains a copy of the networks, an environment class, and the logic for 
+    interacting with the environment, and updating the global network
 
     The worker contains the following method. Mostly this is similar to A2C
     """
 
-    def __init__(self, global_policy_network, global_value_network, global_counter, lock):
+    def __init__(self, global_policy_network, global_value_network, env
+                 global_counter, lock, learning_rate=1e-4):
         
+        # Obtain global networks
+        self.global_policy_network = global_policy_network
+        self.global_value_network = global_value_network
+
         # Initialise thread-specific model
-        thread_policy_network = PolicyNetwork(observation_space, action_space, fc1_units=128)
-        thread_value_network = ValueNetwork(observation_space, fc1_units=128)
+        self.thread_policy_network = PolicyNetwork(observation_space, action_space, fc1_units=128)
+        self.thread_value_network = ValueNetwork(observation_space, fc1_units=128)
+
+        # Get environment
+        self.env = env
 
         # Copy the same parameters from the global network
-        thread_policy_network.load_state_dict(global_policy_network.state_dict)
-        thread_value_network.load_state_dict(global_value_network.state_dict)
+        self.thread_policy_network.load_state_dict(global_policy_network.state_dict)
+        self.thread_value_network.load_state_dict(global_value_network.state_dict)
 
-        # Create a new environment
-        self.env, self.observation_space, self.action_space = make_env()
+        # Reset the thread-specific gradients
+        self.optimiser = torch.optim.Adam(list(thread_policy_network.parameters())
+                                      + list(thread_value_network.parameters()), lr=learning_rate)
+
 
         # Some metrics to track
         self.total_reward = 0
+
+        # Create class variable to store batches of experiences
+        self.batches = []
 
     def act(self, state):
         """Act once base on the current state"""
@@ -159,7 +192,6 @@ class Worker:
             Mean rewards (float)
         """
 
-        batches = []
         rewards = []
 
         for b in range(1):
@@ -187,16 +219,63 @@ class Worker:
 
                 state = next_state
             
-            batches.append(experiences)
+            self.batches.append(experiences)
 
-        return batches, np.mean(rewards)
+        return np.mean(rewards)
 
     def learn(self):
         """
         Learning function, by backprop
         """
 
-def train(policy_network, value_network, global_counter, lock):
+        value_losses = []
+        actor_losses = []
+        entropy_losses = []
+
+        for b in self.batches:
+            states, log_probs, entropys, actions, rewards, next_states, dones = zip(*b)
+
+            # Calculate the discounted return
+            returns = []
+
+            # Make sure the n_step < len(rewards)
+            n_steps = min(n_steps, len(rewards))
+
+            # Convert rewards to discounted n_step returns
+            for i in range(len(rewards - n_steps + 1)):
+                returns.append(calculate_rewards(rewards[i:i + n_steps]))
+
+            for i in range(len(states) - n_steps + 1):
+                current_state_value = self.value_network(states[i])
+                next_state_value = self.value_network(states[i + 1])
+
+                target = returns[i] + gamma * next_state_value * (1 - dones[i])
+                error = target - current_state_value.detach()
+
+                value_loss = error ** 2
+                actor_loss = -log_probs[i] * error.detach()
+
+                value_losses.append(value_loss)
+                actor_losses.append(actor_loss)
+                entropy_losses.append(entropys[i])
+
+        # Optimise
+        sum_value_losses = torch.stack(value_losses).sum()
+        sum_actor_losses = torch.stack(actor_losses).sum()
+        sum_entropy = torch.stack(entropys).sum()
+
+        # Run optimiser and obtain gradient
+        self.optimiser.zero_grad()
+        total_loss = sum_value_losses + sum_actor_losses + ENTROPY_BETA * sum_entropy
+
+        total_loss.backward()
+
+        copy_grad(self.)
+
+            
+
+
+def train(global_policy_network, global_value_network, global_counter, lock):
     """
     The training process
     This is basically the wrapper only. It follows these steps:
@@ -205,6 +284,13 @@ def train(policy_network, value_network, global_counter, lock):
     3. Train the worker by backpropagation
     4. Update the global variable?
     """
+
+    # Define an optimiser
+    optimiser = torch.optim.Adam(list(thread_policy_network.parameters())
+                                 + list(thread_value_network.parameters()), lr=learning_rate))
+
+    # Make environment
+    env, _, _ = make_env()
 
     # Instantiate a worker 
     worker = Worker(policy_network, value_network)
