@@ -41,9 +41,9 @@ from collections import deque, namedtuple
 from torch.distributions import Categorical
 from torch.utils.tensorboard import SummaryWriter
 
-GLOBAL_STEP = 1000
+GLOBAL_STEP = 10000
 NUM_PROCESSES = 4
-ENTROPY_BETA = 1e-3
+ENTROPY_BETA = 1e-2
 
 Experience = namedtuple("Experience",
                         ["state", "log_probs", "entropy", "actions", "rewards",
@@ -144,7 +144,7 @@ class Worker:
 
     def __init__(self, env, worker_id, 
                  global_policy_network, global_value_network,
-                 summary_writer, num_episodes, n_steps=10, gamma=0.99, learning_rate=1e-4):
+                 summary_writer, num_episodes, n_steps=5, gamma=0.99, learning_rate=1e-3):
         
         # Worker ID
         self.worker_id = worker_id
@@ -322,10 +322,10 @@ class Worker:
             ep_reward_list.append(total_rewards)
 
             # # Write to tensorboard
-            # if self.summary_writer is not None:
-            #     self.summary_writer.add_scalar('value_loss', sum_value_losses, ep)
-            #     self.summary_writer.add_scalar('actor_loss', sum_actor_losses, ep)
-            #     self.summary_writer.add_scalar('rewards', total_rewards, ep)
+            if self.summary_writer is not None:
+                self.summary_writer.add_scalar('value_loss', sum_value_losses, ep)
+                self.summary_writer.add_scalar('actor_loss', sum_actor_losses, ep)
+                self.summary_writer.add_scalar('rewards', total_rewards, ep)
 
             # Print average of last 10 episodes if true
             if ep % 100 == 0 and ep != 0:
@@ -336,13 +336,13 @@ class Worker:
                     print("\nProblem solved @ Episode %d" % ep)
                     
                     # Save Actor and critic weights
-                    torch.save(self.global_policy_network.state_dict(), "policy_network_weights_%s.pth" % n_steps)
-                    torch.save(self.value_network.state_dict(), "value_network_weights_%s.pth" % n_steps)
+                    torch.save(self.global_policy_network.state_dict(), "policy_network_weights_%s.pth" % self.n_steps)
+                    torch.save(self.global_value_network.state_dict(), "value_network_weights_%s.pth" % self.n_steps)
                     break
 
         print(".....End Run")
 
-def train(rank, global_policy_network, global_value_network, summary_writer, num_episodes=10000):
+def train(rank, global_policy_network, global_value_network, num_episodes=10000):
     """
     The training process
     This is basically the wrapper only. It follows these steps:
@@ -356,6 +356,9 @@ def train(rank, global_policy_network, global_value_network, summary_writer, num
     # optimiser = torch.optim.Adam(list(global_policy_network.parameters())
     #                              + list(global_value_network.parameters()), lr=learning_rate)
 
+    # Summarywriter
+    summary_writer = SummaryWriter('runs/A3C/worker%s' % rank)
+
     # Make environment
     env, _, _ = make_env()
 
@@ -365,7 +368,7 @@ def train(rank, global_policy_network, global_value_network, summary_writer, num
                     summary_writer, num_episodes=10000)
 
     # Run the worker to collect the experiences
-    mean_rewards = worker.train()
+    worker.train()
 
 
 if __name__ == "__main__":
@@ -391,12 +394,10 @@ if __name__ == "__main__":
     processes = []
     # mp.set_start_method('spawn')
     for rank in range(NUM_PROCESSES):
-        summary_writer = SummaryWriter('runs/A3C/worker%s' % rank)
         env = make_env()
         p = mp.Process(target=train, 
                        args=(rank,
-                             global_policy_network, global_value_network, 
-                             summary_writer))
+                             global_policy_network, global_value_network))
         # First start the model across `NUM_PROCESSES` processes
         p.start()
         processes.append(p)
