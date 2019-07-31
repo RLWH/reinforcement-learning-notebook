@@ -166,10 +166,6 @@ class Worker:
         # Set number of episodes to run
         self.num_episodes = num_episodes
 
-        # Copy the same parameters from the global network
-        self.thread_policy_network.load_state_dict(global_policy_network.state_dict())
-        self.thread_value_network.load_state_dict(global_value_network.state_dict())
-
         # Setup the optimiser that optimise the global network parameters
         self.global_optimiser = torch.optim.Adam(list(self.global_policy_network.parameters())
                                       + list(self.global_value_network.parameters()), lr=learning_rate)
@@ -193,6 +189,13 @@ class Worker:
         Reset the environment and respective memories
         """
         self.batches = []
+
+    def copy_params(self):
+        """
+        Copy the parameters from globalnet to threadnet
+        """
+        self.thread_policy_network.load_state_dict(self.global_policy_network.state_dict())
+        self.thread_value_network.load_state_dict(self.global_value_network.state_dict())
 
     def act(self, state):
         """Act once base on the current state"""
@@ -313,6 +316,7 @@ class Worker:
         for ep in range(self.num_episodes):
             # print("Episode %s of worker %s" % (ep, self.worker_id))
             self.reset()
+            self.copy_params()
             total_rewards = self.run()
             sum_value_losses, sum_actor_losses, total_loss = self.learn()
             ep_reward_list.append(total_rewards)
@@ -326,10 +330,10 @@ class Worker:
             # Print average of last 10 episodes if true
             if ep % 100 == 0 and ep != 0:
                 avg_rewards = np.mean(ep_reward_list[-100:])
-                print("Worker %s at Episode %s: Average reward: %s " % (self.worker_id, ep, avg_rewards), end="")
+                print("Worker %s at Episode %s: Average reward: %s " % (self.worker_id, ep, avg_rewards))
 
                 if avg_rewards >= 198:
-                    print("\nProblem solved @ Episode %d" % ep, end="")
+                    print("\nProblem solved @ Episode %d" % ep)
                     
                     # Save Actor and critic weights
                     torch.save(self.global_policy_network.state_dict(), "policy_network_weights_%s.pth" % n_steps)
