@@ -39,7 +39,7 @@ import numpy as np
 
 from collections import deque, namedtuple
 from torch.distributions import Categorical
-from tensorboardX import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter
 
 GLOBAL_STEP = 1000
 NUM_PROCESSES = 4
@@ -101,20 +101,18 @@ def calculate_rewards(rewards, gamma=0.99):
 
     return G
 
-def make_env():
+def make_env(env_name="CartPole-v0"):
     """
     Make environment
     """
     
     # Make environment
-    env = gym.make("Taxi-v2")
+    env = gym.make(env_name)
 
     # Observation space and action space
-    observation_space = env.observation_space.n
+    observation_space = env.observation_space.shape[0]
     action_space = env.action_space.n
 
-    print("Observation space: %d" % observation_space)
-    print("Action space: %d" % action_space)
 
     return env, observation_space, action_space
 
@@ -132,7 +130,7 @@ def copy_grad(from_net, to_net):
     # For each of the parameters from the from_net, extract the gradient
     # Note that the gradient exists only when the backward() operation is called
     for param_name, param in from_net.named_parameters():
-        to_net_params[param_name].grad[:] = param.grad
+        to_net_params[param_name].grad = param.grad
     
 
 class Worker:
@@ -144,9 +142,16 @@ class Worker:
     The worker contains the following method. Mostly this is similar to A2C
     """
 
-    def __init__(self, global_policy_network, global_value_network, env
-                 global_counter, lock, learning_rate=1e-4):
+    def __init__(self, env, worker_id, 
+                 global_policy_network, global_value_network,
+                 summary_writer, num_episodes, n_steps=10, gamma=0.99, learning_rate=1e-4):
         
+        # Worker ID
+        self.worker_id = worker_id
+
+        # Summary writer
+        self.summary_writer = summary_writer
+
         # Obtain global networks
         self.global_policy_network = global_policy_network
         self.global_value_network = global_value_network
@@ -158,9 +163,12 @@ class Worker:
         # Get environment
         self.env = env
 
+        # Set number of episodes to run
+        self.num_episodes = num_episodes
+
         # Copy the same parameters from the global network
-        self.thread_policy_network.load_state_dict(global_policy_network.state_dict)
-        self.thread_value_network.load_state_dict(global_value_network.state_dict)
+        self.thread_policy_network.load_state_dict(global_policy_network.state_dict())
+        self.thread_value_network.load_state_dict(global_value_network.state_dict())
 
         # Setup the optimiser that optimise the global network parameters
         self.global_optimiser = torch.optim.Adam(list(self.global_policy_network.parameters())
@@ -170,6 +178,20 @@ class Worker:
         self.total_reward = 0
 
         # Create class variable to store batches of experiences
+        self.batches = []
+
+        # Other parameters
+        self.n_steps = n_steps
+        self.gamma = gamma
+        self.learning_rate = learning_rate
+
+        # Print relevant messages
+        print("Worker ID %s instantiated. " % self.worker_id)
+
+    def reset(self):
+        """
+        Reset the environment and respective memories
+        """
         self.batches = []
 
     def act(self, state):
@@ -182,7 +204,7 @@ class Worker:
 
         return log_probs, action.item(), entropy
 
-    def run(self)):
+    def run(self):
         """
         Roll out the steps
         
@@ -197,13 +219,13 @@ class Worker:
 
             experiences = []
             total_reward = 0
-            state = torch.FloatTensor(env.reset())
+            state = torch.FloatTensor(self.env.reset())
 
             for i in range(GLOBAL_STEP):
                 # For the first n steps, only generate and save the experience
 
                 log_prob, action, entropy = self.act(state)
-                next_state, reward, done, _ = env.step(action)
+                next_state, reward, done, _ = self.env.step(action)
                 next_state = torch.FloatTensor(next_state)
 
                 exp = Experience(state, log_prob, entropy,
@@ -238,17 +260,17 @@ class Worker:
             returns = []
 
             # Make sure the n_step < len(rewards)
-            n_steps = min(n_steps, len(rewards))
+            n_steps = min(self.n_steps, len(rewards))
 
             # Convert rewards to discounted n_step returns
-            for i in range(len(rewards - n_steps + 1)):
+            for i in range(len(rewards) - n_steps + 1):
                 returns.append(calculate_rewards(rewards[i:i + n_steps]))
 
             for i in range(len(states) - n_steps + 1):
-                current_state_value = self.value_network(states[i])
-                next_state_value = self.value_network(states[i + 1])
+                current_state_value = self.thread_value_network(states[i])
+                next_state_value = self.thread_value_network(states[i + 1])
 
-                target = returns[i] + gamma * next_state_value * (1 - dones[i])
+                target = returns[i] + self.gamma * next_state_value * (1 - dones[i])
                 error = target - current_state_value.detach()
 
                 value_loss = error ** 2
@@ -266,20 +288,57 @@ class Worker:
         # Calculate the loss
         total_loss = sum_value_losses + sum_actor_losses + ENTROPY_BETA * sum_entropy
 
-        # Obtain gradient
-        total_loss.backward()
-
         # Run optimiser
         self.global_optimiser.zero_grad()
 
+        # Backward prop
+        total_loss.backward()
+
         # Copy Gradient
-        copy_grad(self.thread_policy_network, self.global_policy_network)
-        copy_grad(self.thread_value_network, self.global_value_network)
+        copy_grad(from_net=self.thread_policy_network, to_net=self.global_policy_network)
+        copy_grad(from_net=self.thread_value_network, to_net=self.global_value_network)
 
         # Run one step backprop
-        self.global_optimiser.step() 
+        self.global_optimiser.step()
 
-def train(global_policy_network, global_value_network, global_counter, lock):
+        return sum_value_losses, sum_actor_losses, total_loss
+
+    def train(self):
+        """
+        Run the whole running and learning steps for x episodes
+        """
+
+        ep_reward_list = []
+
+        for ep in range(self.num_episodes):
+            # print("Episode %s of worker %s" % (ep, self.worker_id))
+            self.reset()
+            total_rewards = self.run()
+            sum_value_losses, sum_actor_losses, total_loss = self.learn()
+            ep_reward_list.append(total_rewards)
+
+            # # Write to tensorboard
+            # if self.summary_writer is not None:
+            #     self.summary_writer.add_scalar('value_loss', sum_value_losses, ep)
+            #     self.summary_writer.add_scalar('actor_loss', sum_actor_losses, ep)
+            #     self.summary_writer.add_scalar('rewards', total_rewards, ep)
+
+            # Print average of last 10 episodes if true
+            if ep % 100 == 0 and ep != 0:
+                avg_rewards = np.mean(ep_reward_list[-100:])
+                print("Worker %s at Episode %s: Average reward: %s " % (self.worker_id, ep, avg_rewards), end="")
+
+                if avg_rewards >= 198:
+                    print("\nProblem solved @ Episode %d" % ep, end="")
+                    
+                    # Save Actor and critic weights
+                    torch.save(self.global_policy_network.state_dict(), "policy_network_weights_%s.pth" % n_steps)
+                    torch.save(self.value_network.state_dict(), "value_network_weights_%s.pth" % n_steps)
+                    break
+
+        print(".....End Run")
+
+def train(rank, global_policy_network, global_value_network, summary_writer, num_episodes=10000):
     """
     The training process
     This is basically the wrapper only. It follows these steps:
@@ -289,21 +348,20 @@ def train(global_policy_network, global_value_network, global_counter, lock):
     4. Update the global variable?
     """
 
-    # Define an optimiser
-    optimiser = torch.optim.Adam(list(thread_policy_network.parameters())
-                                 + list(thread_value_network.parameters()), lr=learning_rate))
+    # # Define an optimiser
+    # optimiser = torch.optim.Adam(list(global_policy_network.parameters())
+    #                              + list(global_value_network.parameters()), lr=learning_rate)
 
     # Make environment
     env, _, _ = make_env()
 
     # Instantiate a worker 
-    worker = Worker(policy_network, value_network)
+    worker = Worker(env, rank,
+                    global_policy_network, global_value_network,
+                    summary_writer, num_episodes=10000)
 
     # Run the worker to collect the experiences
-    batches, mean_rewards = worker.run()
-
-    # Learn the parameters
-    worker.learn() 
+    mean_rewards = worker.train()
 
 
 if __name__ == "__main__":
@@ -316,28 +374,25 @@ if __name__ == "__main__":
     global_value_network = ValueNetwork(observation_space, fc1_units=128)
 
     # Set multiprocessing
-    num_processes = 4
     processes = []
 
     # Share the global parameters in multiprocessing
     global_policy_network.share_memory()
     global_value_network.share_memory()
 
-    # Setup optimisers
-    actor_optimiser = torch.optim.Adam(global_policy_network.parameters(), lr=1e-5)
-    critic_optimiser = torch.optim.Adam(global_value_network.parameters(), lr=1e-3)
-
     # Start the processes
-
     global_counter = mp.Value('i', 0)
     lock = mp.Lock()
 
     processes = []
-    mp.set_start_method('spawn')
+    # mp.set_start_method('spawn')
     for rank in range(NUM_PROCESSES):
+        summary_writer = SummaryWriter('runs/A3C/worker%s' % rank)
+        env = make_env()
         p = mp.Process(target=train, 
-                       args=(global_policy_network, global_value_network,
-                             global_counter, lock))
+                       args=(rank,
+                             global_policy_network, global_value_network, 
+                             summary_writer))
         # First start the model across `NUM_PROCESSES` processes
         p.start()
         processes.append(p)
